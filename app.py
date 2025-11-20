@@ -1,271 +1,214 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import time
-import json
 from datetime import datetime, timedelta
-from kafka import KafkaConsumer
-from kafka.errors import KafkaError, NoBrokersAvailable
-from streamlit_autorefresh import st_autorefresh
-import subprocess
-import json
+import random
 import io
+from streamlit_autorefresh import st_autorefresh
 
-# Page configuration
-st.set_page_config(
-    page_title="Streaming Data Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
-def setup_sidebar():
-    st.sidebar.title("Dashboard Controls")
+PRIMARY = "#00897B"
+ACCENT = "#004D40"
+BG = "#F4F6F6"
+CARD_BG = "#FFFFFF"
 
-    st.sidebar.subheader("Data Source Configuration")
-    kafka_broker = st.sidebar.text_input(
-        "Kafka Broker",
-        value="localhost:9092",
-        help="Kafka broker address"
-    )
 
-    kafka_topic = st.sidebar.text_input(
-        "Kafka Topic",
-        value="streaming-data",
-        help="Kafka topic to consume from"
-    )
+st.set_page_config(page_title="Simple Stream Dashboard", page_icon="📡", layout="wide")
 
-    st.sidebar.subheader("Storage Configuration")
-    storage_type = st.sidebar.selectbox(
-        "Storage Type",
-        ["HDFS"],
-        help="Historical storage system"
-    )
 
-    st.sidebar.subheader("HDFS Settings")
-    hdfs_dir = st.sidebar.text_input(
-        "HDFS Directory",
-        value="/user/streaming/dashboard",
-        help="Directory where producer stores history"
-    )
-    st.session_state['hdfs_dir'] = hdfs_dir
+st.markdown(f"""
+<style>
+   :root {{ --primary: {PRIMARY}; --accent: {ACCENT}; --bg: {BG}; --card: {CARD_BG}; }}
+   body {{ background-color: var(--bg); }}
+   .stApp {{ background-color: var(--bg); }}
+   .block-container {{ padding-top: 1rem; }}
+   .stSidebar {{ background-color: var(--card); box-shadow: 0 2px 6px rgba(0,0,0,0.06); border-radius: 8px; }}
+   .stButton>button {{ background-color: var(--primary); color: white; border-radius: 6px; }}
+   .stMetricValue {{ color: var(--accent) !important; }}
+   .stHeader {{ color: var(--primary); }}
+</style>
+""", unsafe_allow_html=True)
 
-    return {
-        "kafka_broker": kafka_broker,
-        "kafka_topic": kafka_topic,
-        "storage_type": storage_type
-    }
 
-def generate_sample_data():
-    current_time = datetime.now()
-    times = [current_time - timedelta(minutes=i) for i in range(100, 0, -1)]
 
-    return pd.DataFrame({
-        'timestamp': times,
-        'value': [100 + i * 0.5 + (i % 10) for i in range(100)],
-        'metric_type': ['temperature'] * 100,
-        'sensor_id': ['sensor_1'] * 100
-    })
 
-def consume_kafka_data(config):
-    kafka_broker = config.get("kafka_broker", "localhost:9092")
-    kafka_topic = config.get("kafka_topic", "streaming-data")
+def generate_live_rows(n=20, start_time=None):
+   if start_time is None:
+       start_time = datetime.now()
+   rows = []
+   base = 100.0
+   for i in range(n):
+       t = start_time - timedelta(seconds=(n - i) * 2)
+       rows.append({
+           "timestamp": t,
+           "sensor_id": f"sensor_{random.randint(1,4)}",
+           "metric_type": random.choice(["temperature", "humidity"]),
+           "value": round(base + random.uniform(-5, 5) + i * 0.1, 2)
+       })
+   return pd.DataFrame(rows)
 
-    cache_key = f"kafka_consumer_{kafka_broker}_{kafka_topic}"
-    if cache_key not in st.session_state:
-        try:
-            st.session_state[cache_key] = KafkaConsumer(
-                kafka_topic,
-                bootstrap_servers=[kafka_broker],
-                auto_offset_reset='latest',
-                enable_auto_commit=True,
-                value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-                consumer_timeout_ms=5000
-            )
-        except Exception as e:
-            st.error(f"Kafka connection failed: {e}")
-            st.session_state[cache_key] = None
 
-    consumer = st.session_state[cache_key]
-    if not consumer:
-        return generate_sample_data()
 
-    try:
-        messages = []
-        start_time = time.time()
 
-        while time.time() - start_time < 5 and len(messages) < 10:
-            msg_pack = consumer.poll(timeout_ms=1000)
+def parse_uploaded_csv(uploaded_file):
+   try:
+       df = pd.read_csv(uploaded_file)
+       if "timestamp" in df.columns:
+           df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+       return df
+   except Exception:
+       return None
 
-            for tp, batch in msg_pack.items():
-                for msg in batch:
-                    data = msg.value
-                    try:
-                        timestamp = data['timestamp']
-                        if timestamp.endswith('Z'):
-                            timestamp = timestamp[:-1] + '+00:00'
-                        data['timestamp'] = datetime.fromisoformat(timestamp)
-                        messages.append(data)
-                    except:
-                        continue
 
-        if messages:
-            return pd.DataFrame(messages)
-        return generate_sample_data()
 
-    except Exception as e:
-        st.warning(f"Kafka error: {e}")
-        return generate_sample_data()
 
-def query_historical_data(time_range="1h", metrics=None):
-    st.info("Reading historical data from HDFS...")
+def format_df_for_plot(df):
+   df2 = df.copy()
+   if "timestamp" in df2.columns:
+       df2 = df2.sort_values("timestamp")
+   return df2
 
-    hdfs_dir = st.session_state.get("hdfs_dir", "/user/streaming/dashboard")
-    records = []
 
-    # Try CLI first
-    try:
-        cmd = ["hdfs", "dfs", "-cat", f"{hdfs_dir}/*"]
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-        if p.returncode == 0:
-            for line in p.stdout.splitlines():
-                if line.strip():
-                    try:
-                        records.append(json.loads(line))
-                    except:
-                        pass
-        else:
-            st.warning("No HDFS files found — showing sample data instead.")
-            return generate_sample_data()
 
-    except FileNotFoundError:
-        st.error("HDFS CLI not found — cannot read historical data.")
-        return generate_sample_data()
+st.sidebar.title("Controls")
+mode = st.sidebar.selectbox("Mode", ["Live (simulated)", "Upload CSV", "Sample data"])
+auto_refresh = st.sidebar.checkbox("Auto-refresh (Live)", value=True)
+refresh_interval = st.sidebar.slider("Refresh interval (seconds)", 2, 30, 5)
+refresh_trigger = st_autorefresh(interval=refresh_interval * 1000, key="auto_refresh_counter")
+show_table = st.sidebar.checkbox("Show raw table", value=False)
+download_btn = st.sidebar.button("Download current data (CSV)")
 
-    if not records:
-        st.info("No history yet — waiting for producer to write files.")
-        return generate_sample_data()
 
-    df = pd.DataFrame(records)
-    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+st.sidebar.markdown("---")
+st.sidebar.subheader("Filters")
+metric_filter = st.sidebar.multiselect("Metric Type", ["temperature", "humidity"], default=["temperature","humidity"])
+sensor_filter = st.sidebar.multiselect("Sensor ID", ["sensor_1","sensor_2","sensor_3","sensor_4"], default=[])
 
-    now = pd.Timestamp.utcnow()
-    if time_range.endswith('h'):
-        df = df[df['timestamp'] >= now - pd.Timedelta(hours=int(time_range[:-1]))]
-    elif time_range.endswith('d'):
-        df = df[df['timestamp'] >= now - pd.Timedelta(days=int(time_range[:-1]))]
 
-    if metrics:
-        df = df[df['metric_type'].isin(metrics)]
+data_df = pd.DataFrame()
 
-    df = df.sort_values('timestamp')
 
-    return df
+if mode == "Sample data":
+   data_df = generate_live_rows(200, start_time=datetime.now())
 
-def display_real_time_view(config, refresh_interval):
-    st.header("📈 Real-time Streaming Dashboard")
 
-    refresh_state = st.session_state.refresh_state
-    st.info(f"Auto-refresh: {'🟢 On' if refresh_state['auto_refresh'] else '🔴 Off'} | Interval: {refresh_interval}s")
+elif mode == "Upload CSV":
+   uploaded = st.sidebar.file_uploader("Upload CSV with at least 'timestamp' and 'value' columns", type=["csv"])
+   if uploaded is not None:
+       parsed = parse_uploaded_csv(uploaded)
+       if parsed is None:
+           st.sidebar.error("Failed to parse CSV.")
+       else:
+           data_df = parsed
+   else:
+       st.sidebar.info("No file uploaded.")
 
-    with st.spinner("Fetching real-time data..."):
-        real_time_data = consume_kafka_data(config)
 
-    if real_time_data is None or real_time_data.empty:
-        st.warning("No data found.")
-        return
+elif mode == "Live (simulated)":
+   if "live_buffer" not in st.session_state:
+       st.session_state.live_buffer = generate_live_rows(60)
+       st.session_state.last_live_time = datetime.now()
+   if auto_refresh:
+       new_rows = generate_live_rows(5, start_time=datetime.now())
+       st.session_state.live_buffer = pd.concat([st.session_state.live_buffer, new_rows], ignore_index=True)
+       st.session_state.live_buffer = st.session_state.live_buffer.tail(500).reset_index(drop=True)
+   data_df = st.session_state.live_buffer.copy()
 
-    data_freshness = datetime.now() - refresh_state['last_refresh']
-    freshness_color = "🟢" if data_freshness.total_seconds() < 10 else "🟡"
 
-    st.success(f"{freshness_color} Updated {data_freshness.total_seconds():.0f}s ago")
+if not data_df.empty:
+   if "metric_type" in data_df.columns and metric_filter:
+       data_df = data_df[data_df["metric_type"].isin(metric_filter)]
+   if sensor_filter:
+       if "sensor_id" in data_df.columns:
+           data_df = data_df[data_df["sensor_id"].isin(sensor_filter)]
 
-    st.subheader("Live Metrics")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Records", len(real_time_data))
-    col2.metric("Latest Value", f"{real_time_data['value'].iloc[-1]:.2f}")
-    col3.metric("Time Range", f"{real_time_data['timestamp'].min().strftime('%H:%M')} - {real_time_data['timestamp'].max().strftime('%H:%M')}")
 
-    st.subheader("📈 Real-time Trend")
-    fig = px.line(
-        real_time_data,
-        x="timestamp",
-        y="value",
-        title="Live Sensor Stream",
-        template="plotly_white"
-    )
-    st.plotly_chart(fig, use_container_width=True)
+st.title("📡 Simple Streaming Dashboard")
+col1, col2 = st.columns([3,1])
 
-    with st.expander("Raw Data"):
-        st.dataframe(real_time_data.sort_values('timestamp', ascending=False), height=300)
 
-def display_historical_view(config):
-    st.header("📊 Historical Data")
+with col1:
+   st.subheader("Trend")
+   if data_df.empty:
+       st.info("No data available.")
+   else:
+       chart_container = st.empty()
 
-    st.subheader("Filters")
-    col1, col2, col3 = st.columns(3)
 
-    time_range = col1.selectbox("Time Range", ["1h", "24h", "7d", "30d"])
-    metric_type = col2.selectbox("Metric Type", ["temperature", "all"])
-    aggregation = col3.selectbox("Aggregation", ["raw", "hourly", "daily"])
+       df_plot = format_df_for_plot(data_df)
 
-    metrics = [metric_type] if metric_type != "all" else None
 
-    historical_data = query_historical_data(time_range, metrics)
+       if "metric_type" in df_plot.columns:
+           df_plot["metric_type"] = df_plot["metric_type"].fillna("unknown")
+       else:
+           df_plot["metric_type"] = "unknown"
 
-    st.subheader("Historical Table")
-    st.dataframe(historical_data, hide_index=True)
 
-    st.subheader("Trend")
-    fig = px.line(historical_data, x="timestamp", y="value", title="Historical Trend")
-    st.plotly_chart(fig, use_container_width=True)
+       if "timestamp" in df_plot.columns:
+           fig = px.line(
+               df_plot,
+               x="timestamp",
+               y="value",
+               color="metric_type",
+               color_discrete_sequence=[PRIMARY, ACCENT]
+           )
+       else:
+           fig = px.line(
+               df_plot.reset_index(),
+               x="index",
+               y="value",
+               color="metric_type",
+               color_discrete_sequence=[PRIMARY, ACCENT]
+           )
 
-    st.subheader("Stats")
-    col1, col2 = st.columns(2)
-    col1.metric("Total Records", len(historical_data))
-    col1.metric("Average Value", f"{historical_data['value'].mean():.2f}")
-    col2.metric("Min Value", f"{historical_data['value'].min():.2f}")
-    col2.metric("Max Value", f"{historical_data['value'].max():.2f}")
 
-def main():
-    st.title("🚀 Streaming Data Dashboard")
+       fig.update_layout(margin=dict(t=30, l=10, r=10, b=10))
+       chart_container.plotly_chart(fig, use_container_width=True)
 
-    if 'refresh_state' not in st.session_state:
-        st.session_state.refresh_state = {
-            'last_refresh': datetime.now(),
-            'auto_refresh': True
-        }
 
-    config = setup_sidebar()
+   with st.expander("Quick stats"):
+       if data_df.empty:
+           st.write("-")
+       else:
+           avg = data_df["value"].mean()
+           mn = data_df["value"].min()
+           mx = data_df["value"].max()
+           st.metric("Average value", f"{avg:.2f}")
+           st.metric("Min value", f"{mn:.2f}")
+           st.metric("Max value", f"{mx:.2f}")
 
-    st.sidebar.subheader("Refresh Settings")
-    st.session_state.refresh_state['auto_refresh'] = st.sidebar.checkbox(
-        "Enable Auto Refresh",
-        value=True
-    )
 
-    refresh_interval = st.sidebar.slider("Refresh Interval (seconds)", 5, 60, 15)
+with col2:
+   st.subheader("Controls & Info")
+   st.markdown(f"- Mode: **{mode}**")
+   st.markdown(f"- Rows: **{len(data_df)}**")
+   if "timestamp" in data_df.columns:
+       last_ts = data_df["timestamp"].max()
+       if pd.isna(last_ts):
+           st.markdown("- Last timestamp: N/A")
+       else:
+           clean_ts = pd.to_datetime(last_ts).strftime("%Y-%m-%d %H:%M:%S")
+           st.markdown(f"- Last timestamp: **{clean_ts}**")
+   st.markdown("---")
 
-    if st.session_state.refresh_state['auto_refresh']:
-        st_autorefresh(interval=refresh_interval * 1000, key="auto_refresh")
 
-    if st.sidebar.button("🔄 Manual Refresh"):
-        st.session_state.refresh_state['last_refresh'] = datetime.now()
-        st.rerun()
+if show_table and not data_df.empty:
+   st.subheader("Raw data (latest first)")
+   display_df = data_df.sort_values("timestamp", ascending=False) if "timestamp" in data_df.columns else data_df
+   if "timestamp" in display_df.columns:
+       display_df = display_df.assign(timestamp=display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S"))
+   st.dataframe(display_df.reset_index(drop=True), height=350)
 
-    st.sidebar.metric("Last Refresh", st.session_state.refresh_state['last_refresh'].strftime("%H:%M:%S"))
 
-    tab1, tab2 = st.tabs(["📈 Real-time Streaming", "📊 Historical Data"])
+if download_btn and not data_df.empty:
+   to_download = data_df.copy()
+   if "timestamp" in to_download.columns:
+       to_download["timestamp"] = to_download["timestamp"].astype(str)
+   csv_buf = to_download.to_csv(index=False).encode("utf-8")
+   st.download_button("Download CSV", data=csv_buf, file_name="export.csv", mime="text/csv")
 
-    with tab1:
-        display_real_time_view(config, refresh_interval)
 
-    with tab2:
-        display_historical_view(config)
-
-if __name__ == "__main__":
-    main()
 
 
 
